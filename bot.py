@@ -36,6 +36,7 @@ _state = {
     "id": 0, "title": "", "text": "",
     "image": "",   # base64 JPEG/PNG (или пусто)
     "sound": "",   # base64 MP3/OGG  (или пусто)
+    "volume": 100, # громкость звука в процентах: 0..100
     "targets": [], # [] = всем; иначе список строк user_id
     "ts": 0,
 }
@@ -76,7 +77,7 @@ def load_all():
 # ------------------------------------------------------------------ публикация
 def publish(title: str, text: str,
             image_b64: str = "", sound_b64: str = "",
-            targets: list | None = None) -> int:
+            targets: list | None = None, volume: int = 100) -> int:
     """Новое сообщение. targets=None → всем; targets=["123","456"] → только им."""
     with _lock:
         _state["id"]      = max(int(_state["id"]) + 1, int(time.time()))
@@ -84,6 +85,7 @@ def publish(title: str, text: str,
         _state["text"]    = text[:4000]
         _state["image"]   = image_b64
         _state["sound"]   = sound_b64
+        _state["volume"]  = max(0, min(100, int(volume)))
         _state["targets"] = [str(t) for t in (targets or [])]
         _state["ts"]      = int(time.time())
         _save_json(DATA_FILE, _state)
@@ -96,7 +98,7 @@ def _api_body_for(user_id: str) -> bytes:
         tgts = _state.get("targets") or []
         if tgts and str(user_id) not in tgts:
             # не для этого пользователя — пустой ответ (id=0 → плагин игнорирует)
-            return json.dumps({"id": 0, "title": "", "text": "", "image": "", "sound": ""},
+            return json.dumps({"id": 0, "title": "", "text": "", "image": "", "sound": "", "volume": 100},
                               ensure_ascii=False).encode()
         return json.dumps({
             "id":    int(_state["id"]),
@@ -104,6 +106,7 @@ def _api_body_for(user_id: str) -> bytes:
             "text":  _state["text"],
             "image": _state.get("image", ""),
             "sound": _state.get("sound", ""),
+            "volume": int(_state.get("volume", 100)),
         }, ensure_ascii=False).encode()
 
 
@@ -296,20 +299,84 @@ def users_keyboard(selected: set[str] | None = None) -> dict:
 # ------------------------------------------------------------------ bot logic
 HELP = (
     "📢 Рассылка Universal\n\n"
-    "Что отправить:\n"
-    "• Текст — просто напишите сообщение\n"
-    "• Картинка — пришлите фото (можно с подписью)\n"
-    "• Звук — пришлите аудиофайл\n"
-    "• Всё вместе — сначала фото, потом .send\n\n"
-    "/users — список пользователей плагина\n"
-    "/status — что показывается сейчас\n"
-    "/clear — снять сообщение\n\n"
-    "После предпросмотра вы выберете: отправить всем или конкретным людям."
+    "Нажмите кнопку «Отправить рассылку», затем добавьте текст, фото или звук.\n"
+    "Громкость звука настраивается от 0 до 100%.\n\n"
+    "/users — список пользователей\n"
+    "/status — текущая публикация\n"
+    "/clear — снять сообщение\n"
+    "/menu — открыть меню"
 )
 
 
+def main_keyboard() -> dict:
+    return {"inline_keyboard": [[
+        {"text": "📨 Отправить рассылку", "callback_data": "new_broadcast"}
+    ]]}
+
+
+def editor_keyboard() -> dict:
+    return {"inline_keyboard": [
+        [
+            {"text": "✏️ Добавить текст", "callback_data": "add_text"},
+            {"text": "🖼 Добавить фото", "callback_data": "add_photo"},
+        ],
+        [
+            {"text": "🔊 Добавить звук", "callback_data": "add_sound"},
+            {"text": "🔉 Настройка громкости", "callback_data": "volume_menu"},
+        ],
+        [
+            {"text": "👀 Предпросмотр", "callback_data": "preview"},
+            {"text": "👥 Получатели", "callback_data": "pick_users"},
+        ],
+        [
+            {"text": "🚀 Опубликовать всем", "callback_data": "send_all"},
+            {"text": "❌ Отмена", "callback_data": "cancel"},
+        ],
+    ]}
+
+
+def volume_keyboard(volume: int) -> dict:
+    values = [0, 25, 50, 75, 100]
+    row = []
+    for value in values:
+        mark = " ✓" if value == volume else ""
+        row.append({"text": "%d%%%s" % (value, mark), "callback_data": "vol:%d" % value})
+    return {"inline_keyboard": [row, [
+        {"text": "−10", "callback_data": "vol:-10"},
+        {"text": "+10", "callback_data": "vol:+10"},
+    ], [{"text": "↩️ Назад", "callback_data": "back_editor"}]]}
+
+
 def _draft(chat_id: int) -> dict:
-    return _drafts.setdefault(chat_id, {"title": "", "text": "", "image_b64": "", "sound_b64": ""})
+    return _drafts.setdefault(chat_id, {
+        "title": "", "text": "", "image_b64": "", "sound_b64": "",
+        "volume": 100, "selected": set(), "pending": ""
+    })
+
+
+def _editor_text(d: dict) -> str:
+    parts = ["📝 Настройка рассылки"]
+    parts.append("Текст: %s" % ("добавлен" if d.get("text") else "не добавлен"))
+    parts.append("Фото: %s" % ("добавлено" if d.get("image_b64") else "не добавлено"))
+    parts.append("Звук: %s" % ("добавлен" if d.get("sound_b64") else "не добавлен"))
+    parts.append("Громкость: %d%%" % int(d.get("volume", 100)))
+    parts.append("\nВыберите действие:")
+    return "\n".join(parts)
+
+
+def show_editor(chat_id: int):
+    d = _draft(chat_id)
+    say(chat_id, _editor_text(d), reply_markup=editor_keyboard())
+
+
+def edit_screen(chat_id: int, msg_id: int, text: str, keyboard: dict | None = None):
+    params = {"chat_id": chat_id, "message_id": msg_id, "text": text}
+    if keyboard is not None:
+        params["reply_markup"] = keyboard
+    try:
+        tg("editMessageText", **params)
+    except Exception:
+        say(chat_id, text, **({"reply_markup": keyboard} if keyboard else {}))
 
 
 def handle_message(msg: dict):
@@ -319,110 +386,122 @@ def handle_message(msg: dict):
     audio   = msg.get("audio") or msg.get("voice") or msg.get("document")
     caption = (msg.get("caption") or "").strip()
 
-    # команды
-    if text in ("/start", "/help"):
-        say(chat_id, HELP)
+    if text in ("/start", "/menu"):
+        say(chat_id, "📢 Панель управления рассылкой", reply_markup=main_keyboard())
+        return
+    if text == "/help":
+        say(chat_id, HELP, reply_markup=main_keyboard())
         return
 
     if text == "/status":
-        with _lock: cur = dict(_state)
+        with _lock:
+            cur = dict(_state)
         if cur["text"] or cur["image"] or cur["sound"]:
             parts = ["Сейчас опубликовано (№%d):" % cur["id"]]
             if cur["title"]: parts.append(cur["title"])
-            if cur["text"]:  parts.append(cur["text"])
+            if cur["text"]: parts.append(cur["text"])
             if cur["image"]: parts.append("🖼 Картинка есть")
-            if cur["sound"]: parts.append("🔊 Звук есть")
+            if cur["sound"]: parts.append("🔊 Звук есть, громкость %d%%" % int(cur.get("volume", 100)))
             tgts = cur.get("targets") or []
             parts.append("Получатели: %s" % (", ".join(tgts) if tgts else "все"))
-            say(chat_id, "\n".join(parts))
+            say(chat_id, "\n".join(parts), reply_markup=main_keyboard())
         else:
-            say(chat_id, "Сейчас ничего не показывается.")
+            say(chat_id, "Сейчас ничего не показывается.", reply_markup=main_keyboard())
         return
 
     if text == "/clear":
-        publish("", "", "", "", [])
-        say(chat_id, "✅ Сообщение снято.")
+        publish("", "", "", "", [], volume=100)
+        say(chat_id, "✅ Сообщение снято.", reply_markup=main_keyboard())
         return
 
     if text == "/users":
         rows = users_list()
         if not rows:
-            say(chat_id, "Пока нет зарегистрированных пользователей.")
+            say(chat_id, "Пока нет зарегистрированных пользователей.", reply_markup=main_keyboard())
         else:
             lines = ["👥 Пользователи плагина (%d):" % len(rows)]
             for uid, label in rows[:50]:
                 lines.append("• %s — %s  [%s]" % (label, user_status_label(uid), uid))
-            say(chat_id, "\n".join(lines))
+            say(chat_id, "\n".join(lines), reply_markup=main_keyboard())
         return
 
-    # входящее фото — сохраняем в черновик
+    d = _draft(chat_id)
+    pending = d.get("pending", "")
+
     if photo:
         file_id = photo[-1]["file_id"]
         try:
             raw = download_file(file_id)
-            _draft(chat_id)["image_b64"] = base64.b64encode(raw).decode()
+            d["image_b64"] = base64.b64encode(raw).decode()
             if caption:
-                _draft(chat_id)["text"] = caption
-            say(chat_id,
-                "🖼 Картинка сохранена. Теперь пришлите аудио или напишите текст "
-                "(или /send чтобы отправить как есть).")
+                d["text"] = caption
+            d["pending"] = ""
+            say(chat_id, "✅ Фото добавлено.\n\n" + _editor_text(d), reply_markup=editor_keyboard())
         except Exception as exc:
             say(chat_id, "Не удалось скачать фото: " + str(exc))
         return
 
-    # входящий аудиофайл
     if audio and not text:
-        mime = getattr(audio, "get", lambda k, d=None: audio.get(k, d) if isinstance(audio, dict) else "")
-        file_id = (audio if isinstance(audio, dict) else {}).get("file_id", "")
+        file_id = audio.get("file_id", "") if isinstance(audio, dict) else ""
         if not file_id:
             say(chat_id, "Не могу получить файл.")
             return
         try:
             raw = download_file(file_id)
-            _draft(chat_id)["sound_b64"] = base64.b64encode(raw).decode()
-            say(chat_id, "🔊 Звук сохранён. Напишите текст или /send.")
+            d["sound_b64"] = base64.b64encode(raw).decode()
+            d["pending"] = ""
+            say(chat_id, "✅ Звук добавлен.\n\n" + _editor_text(d), reply_markup=editor_keyboard())
         except Exception as exc:
             say(chat_id, "Не удалось скачать аудио: " + str(exc))
         return
 
-    # /send или просто текст → строим предпросмотр
+    if pending == "text" and text:
+        if "||" in text:
+            title, body = text.split("||", 1)
+            d["title"] = title.strip()
+            d["text"] = body.strip()
+        else:
+            d["text"] = text
+        d["pending"] = ""
+        say(chat_id, "✅ Текст добавлен.\n\n" + _editor_text(d), reply_markup=editor_keyboard())
+        return
+
     if text.startswith("/send"):
         body = text[5:].strip()
         if body:
-            _draft(chat_id)["text"] = body
-    elif text.startswith("/"):
-        say(chat_id, HELP)
-        return
-    else:
-        # разбор «Заголовок || Текст»
-        if "||" in text:
-            t, b = text.split("||", 1)
-            _draft(chat_id)["title"] = t.strip()
-            _draft(chat_id)["text"]  = b.strip()
-        else:
-            _draft(chat_id)["text"] = text
-
-    d = _draft(chat_id)
-    if not d["text"] and not d["image_b64"] and not d["sound_b64"]:
-        say(chat_id, "Введите текст или пришлите фото/аудио.")
+            d["text"] = body
+        d["pending"] = ""
+        _show_preview(chat_id, d)
         return
 
-    _show_preview(chat_id, d)
+    if text.startswith("/"):
+        say(chat_id, HELP, reply_markup=main_keyboard())
+        return
+
+    if text:
+        d["text"] = text
+        _show_preview(chat_id, d)
+        return
+
+    say(chat_id, "Используйте кнопки меню, чтобы собрать рассылку.", reply_markup=main_keyboard())
 
 
 def _show_preview(chat_id: int, d: dict):
     parts = ["👀 Предпросмотр:"]
-    if d["title"]: parts.append("*%s*" % d["title"])
-    if d["text"]:  parts.append(d["text"])
-    if d["image_b64"]: parts.append("🖼 Картинка прикреплена")
-    if d["sound_b64"]: parts.append("🔊 Звук прикреплён")
-    kb = {"inline_keyboard": [[
-        {"text": "📨 Отправить всем",         "callback_data": "send_all"},
-        {"text": "👤 Выбрать получателей",    "callback_data": "pick_users"},
-    ], [
-        {"text": "🗑 Сбросить черновик",       "callback_data": "cancel"},
-    ]]}
-    say(chat_id, "\n".join(parts)[:4000], reply_markup=kb, parse_mode="Markdown")
+    if d.get("title"): parts.append(d["title"])
+    if d.get("text"): parts.append(d["text"])
+    if d.get("image_b64"): parts.append("🖼 Картинка прикреплена")
+    if d.get("sound_b64"):
+        parts.append("🔊 Звук прикреплён, громкость: %d%%" % int(d.get("volume", 100)))
+    if not any((d.get("text"), d.get("image_b64"), d.get("sound_b64"))):
+        parts.append("Пока ничего не добавлено.")
+    kb = {"inline_keyboard": [
+        [{"text": "↩️ К настройкам", "callback_data": "back_editor"}],
+        [{"text": "🚀 Опубликовать всем", "callback_data": "send_all"},
+         {"text": "👥 Выбрать получателей", "callback_data": "pick_users"}],
+        [{"text": "❌ Отмена", "callback_data": "cancel"}],
+    ]}
+    say(chat_id, "\n".join(parts)[:4000], reply_markup=kb)
 
 
 def handle_callback(cb: dict):
@@ -434,6 +513,63 @@ def handle_callback(cb: dict):
         tg("answerCallbackQuery", callback_query_id=cb["id"])
     except Exception:
         pass
+
+    if data == "new_broadcast":
+        _drafts[chat_id] = {
+            "title": "", "text": "", "image_b64": "", "sound_b64": "",
+            "volume": 100, "selected": set(), "pending": ""
+        }
+        edit_screen(chat_id, msg_id, _editor_text(_draft(chat_id)), editor_keyboard())
+        return
+
+    if data in ("add_text", "add_photo", "add_sound"):
+        d = _draft(chat_id)
+        d["pending"] = {"add_text": "text", "add_photo": "photo", "add_sound": "sound"}[data]
+        prompts = {
+            "add_text": "✏️ Отправьте текст одним сообщением.\nМожно указать заголовок так: Заголовок || Текст",
+            "add_photo": "🖼 Теперь отправьте фотографию. Можно добавить подпись к фото.",
+            "add_sound": "🔊 Теперь отправьте аудио или голосовое сообщение.",
+        }
+        edit_screen(chat_id, msg_id, prompts[data], {"inline_keyboard": [[
+            {"text": "↩️ Назад", "callback_data": "back_editor"}
+        ]]})
+        return
+
+    if data == "volume_menu":
+        d = _draft(chat_id)
+        volume = int(d.get("volume", 100))
+        edit_screen(chat_id, msg_id, "🔉 Настройка громкости\nТекущее значение: %d%%" % volume,
+                    volume_keyboard(volume))
+        return
+
+    if data.startswith("vol:"):
+        d = _draft(chat_id)
+        value = data[4:]
+        current = int(d.get("volume", 100))
+        if value == "+10":
+            current += 10
+        elif value == "-10":
+            current -= 10
+        else:
+            try:
+                current = int(value)
+            except ValueError:
+                current = 100
+        d["volume"] = max(0, min(100, current))
+        edit_screen(chat_id, msg_id,
+                    "🔉 Настройка громкости\nТекущее значение: %d%%" % d["volume"],
+                    volume_keyboard(d["volume"]))
+        return
+
+    if data == "back_editor":
+        d = _draft(chat_id)
+        d["pending"] = ""
+        edit_screen(chat_id, msg_id, _editor_text(d), editor_keyboard())
+        return
+
+    if data == "preview":
+        _show_preview(chat_id, _draft(chat_id))
+        return
 
     # выбор пользователя (тоггл чекбокса)
     if data.startswith("usr:"):
@@ -496,7 +632,7 @@ def handle_callback(cb: dict):
                 return
         new_id = publish(d.get("title", ""), d.get("text", ""),
                          d.get("image_b64", ""), d.get("sound_b64", ""),
-                         targets=sel)
+                         targets=sel, volume=int(d.get("volume", 100)))
         who = "%d активным пользователям" % len(sel)
         result = ("✅ Объявление опубликовано на сервере для %s (№%d). "
                   "Это подтверждает публикацию, но не гарантирует фактический показ на устройстве.") % (who, new_id)
@@ -510,7 +646,8 @@ def handle_callback(cb: dict):
     if data == "cancel":
         _drafts.pop(chat_id, None)
         try:
-            tg("editMessageText", chat_id=chat_id, message_id=msg_id, text="Отменено.")
+            tg("editMessageText", chat_id=chat_id, message_id=msg_id,
+               text="Отменено.", reply_markup=main_keyboard())
         except Exception:
             pass
         return
