@@ -1,132 +1,135 @@
 
     
   
-#!/usr/bin/env python3
-"""
-Бот рассылки Universal.
-
-Что умеет:
-  • Рассылка текста, картинки и/или звука всем пользователям плагина.
-  • Выборочная рассылка по конкретным людям из списка.
-  • Плагин сам регистрируется на сервере: /api/register  (POST).
-  • Список всех зарегистрированных пользователей виден в боте.
-
-Запуск:
-    BOT_TOKEN=123:ABC python3 bot.py
-
-Переменные окружения:
-    BOT_TOKEN   токен бота (обязательно)
-    PORT        порт HTTP-сервера (по умолчанию 8080)
-    DATA_FILE   файл с текущим сообщением (data.json)
-    USERS_FILE  файл с пользователями плагина (users.json)
-"""
-import base64, hashlib, json, os, threading, time, urllib.error, urllib.request
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-
-TOKEN    = os.environ.get("BOT_TOKEN", "").strip()
-PORT     = int(os.environ.get("PORT", "8080"))
-DATA_FILE  = os.environ.get("DATA_FILE",  "data.json")
-USERS_FILE = os.environ.get("USERS_FILE", "users.json")
-
-# Heartbeat window: the plugin registers every ~2 seconds while it is running.
-HEARTBEAT_TTL = int(os.environ.get("HEARTBEAT_TTL", "20"))
-
-# ------------------------------------------------------------------ хранилище
-_lock  = threading.Lock()
-
-# текущее сообщение
-_state = {
-    "id": 0, "title": "", "text": "",
-    "image": "",   # base64 JPEG/PNG (или пусто)
-    "sound": "",   # base64 MP3/OGG  (или пусто)
-    "targets": [], # [] = всем; иначе список строк user_id
-    "ts": 0,
-}
-
-# зарегистрированные пользователи плагина
-# ключ — строка user_id, значение — {"username": ..., "first_name": ..., "ts": ...}
-_users: dict = {}
-
-# черновики: chat_id -> {"title", "text", "image_b64", "sound_b64", "targets"}
-_drafts: dict = {}
+    if d["image_b64"]: parts.append("🖼 Картинка прикреплена")
+    if d["sound_b64"]: parts.append("🔊 Звук прикреплён")
+    kb = {"inline_keyboard": [[
+        {"text": "📨 Отправить всем",         "callback_data": "send_all"},
+        {"text": "👤 Выбрать получателей",    "callback_data": "pick_users"},
+    ], [
+        {"text": "🗑 Сбросить черновик",       "callback_data": "cancel"},
+    ]]}
+    say(chat_id, "\n".join(parts)[:4000], reply_markup=kb, parse_mode="Markdown")
 
 
-def _load_json(path, default):
+def handle_callback(cb: dict):
+    uid     = int(cb.get("from", {}).get("id", 0))
+    chat_id = int(cb["message"]["chat"]["id"])
+    msg_id  = int(cb["message"]["message_id"])
+    data    = cb.get("data", "")
     try:
-        with open(path, encoding="utf-8") as f:
-            d = json.load(f)
-        if isinstance(d, type(default)):
-            return d
-    except FileNotFoundError:
+        tg("answerCallbackQuery", callback_query_id=cb["id"])
+    except Exception:
         pass
-    except Exception as exc:
-        print("load", path, exc)
-    return default
 
+    # выбор пользователя (тоггл чекбокса)
+    if data.startswith("usr:"):
+        target_uid = data[4:]
+        sel = _draft(chat_id).setdefault("selected", set())
+        if target_uid in sel:
+            sel.discard(target_uid)
+        else:
+            sel.add(target_uid)
+        try:
+            tg("editMessageReplyMarkup",
+               chat_id=chat_id, message_id=msg_id,
+               reply_markup=users_keyboard(sel))
+        except Exception:
+            pass
+        return
 
-def _save_json(path, data):
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False)
-    os.replace(tmp, path)
+    if data == "pick_users":
+        d = _draft(chat_id)
+        sel = d.get("selected") or set()
+        kb  = users_keyboard(sel)
+        if not users_list():
+            try:
+                tg("editMessageText", chat_id=chat_id, message_id=msg_id,
+                   text="Пока нет зарегистрированных пользователей. "
+                        "Дождитесь, когда кто-то запустит плагин.")
+            except Exception:
+                pass
+            return
+        try:
+            tg("editMessageText", chat_id=chat_id, message_id=msg_id,
+               text="Выберите получателей (нажмите чтобы отметить):",
+               reply_markup=kb)
+        except Exception:
+            pass
+        return
 
-
-def load_all():
-    _state.update(_load_json(DATA_FILE,  _state))
-    _users.update(_load_json(USERS_FILE, {}))
-
-
-# ------------------------------------------------------------------ публикация
-def publish(title: str, text: str,
-            image_b64: str = "", sound_b64: str = "",
-            targets: list | None = None) -> int:
-    """Новое сообщение. targets=None → всем; targets=["123","456"] → только им."""
-    with _lock:
-        _state["id"]      = max(int(_state["id"]) + 1, int(time.time()))
-        _state["title"]   = title[:120]
-        _state["text"]    = text[:4000]
-        _state["image"]   = image_b64
-        _state["sound"]   = sound_b64
-        _state["targets"] = [str(t) for t in (targets or [])]
-        _state["ts"]      = int(time.time())
-        _save_json(DATA_FILE, _state)
-        return _state["id"]
-
-
-# ------------------------------------------------------------------ HTTP API
-def _api_body_for(user_id: str) -> bytes:
-    with _lock:
-        tgts = _state.get("targets") or []
-        if tgts and str(user_id) not in tgts:
-            # не для этого пользователя — пустой ответ (id=0 → плагин игнорирует)
-            return json.dumps({"id": 0, "title": "", "text": "", "image": "", "sound": ""},
-                              ensure_ascii=False).encode()
-        return json.dumps({
-            "id":    int(_state["id"]),
-            "title": _state["title"],
-            "text":  _state["text"],
-            "image": _state.get("image", ""),
-            "sound": _state.get("sound", ""),
-        }, ensure_ascii=False).encode()
-
-
-class Handler(BaseHTTPRequestHandler):
-    def log_message(self, *a): pass
-
-    def do_GET(self):
-        path = self.path.split("?", 1)[0].rstrip("/")
-
-        if path == "/api":
-            # плагин передаёт свой user_id через заголовок или query-param
-            uid = ""
-            qs  = self.path.split("?", 1)[1] if "?" in self.path else ""
-            for part in qs.split("&"):
-                if part.startswith("uid="):
-                    uid = part[4:]
-            uid = uid or self.headers.get("X-User-Id", "")
-            body = _api_body_for(uid)
-            etag = '"%s"' % hashlib.md5(body).hexdigest()
-            if self.headers.get("If-None-Match", "").strip() == etag:
-                self._send(304, b"", etag=etag)
+    if data in ("send_all", "send_sel"):
+        d = _draft(chat_id)
+        if not (d.get("text") or d.get("image_b64") or d.get("sound_b64")):
+            say(chat_id, "ℹ️ Этот черновик уже опубликован или пуст. Создайте новое сообщение.")
+            return
+        if data == "send_sel":
+            sel = list(d.get("selected") or set())
+            if not sel:
+                say(chat_id, "Никто не выбран. Нажмите «Всем» или отметьте пользователей.")
                 return
+            inactive = [target for target in sel if not user_is_active(target)]
+            if inactive:
+                labels = dict(users_list())
+                names = [labels.get(target, "id" + target) for target in inactive]
+                say(chat_id, "⛔ Не опубликовано: у выбранных пользователей плагин сейчас не на связи: "
+                             + ", ".join(names)
+                             + ". Это может означать, что плагин выключен, приложение закрыто или нет интернета.")
+                return
+        else:
+            sel = active_user_ids()
+            if not sel:
+                say(chat_id, "⛔ Не опубликовано: сейчас нет пользователей с активным heartbeat плагина.")
+                return
+        new_id = publish(d.get("title", ""), d.get("text", ""),
+                         d.get("image_b64", ""), d.get("sound_b64", ""),
+                         targets=sel)
+        who = "%d активным пользователям" % len(sel)
+        result = ("✅ Объявление опубликовано на сервере для %s (№%d). "
+                  "Это подтверждает публикацию, но не гарантирует фактический показ на устройстве.") % (who, new_id)
+        _drafts.pop(chat_id, None)
+        try:
+            tg("editMessageText", chat_id=chat_id, message_id=msg_id, text=result)
+        except Exception:
+            say(chat_id, result)
+        return
+
+    if data == "cancel":
+        _drafts.pop(chat_id, None)
+        try:
+            tg("editMessageText", chat_id=chat_id, message_id=msg_id, text="Отменено.")
+        except Exception:
+            pass
+        return
+
+
+def run_bot():
+    offset = 0
+    while True:
+        try:
+            updates = tg("getUpdates", offset=offset, timeout=30,
+                         allowed_updates=["message", "callback_query"]) or []
+            for upd in updates:
+                offset = upd["update_id"] + 1
+                try:
+                    if "message" in upd:
+                        handle_message(upd["message"])
+                    elif "callback_query" in upd:
+                        handle_callback(upd["callback_query"])
+                except Exception as exc:
+                    print("update:", exc)
+        except Exception as exc:
+            print("getUpdates:", exc)
+            time.sleep(3)
+
+
+if __name__ == "__main__":
+    load_all()
+    threading.Thread(target=run_http, daemon=True).start()
+    print("HTTP  http://0.0.0.0:%d/api" % PORT)
+    if not TOKEN:
+        print("BOT_TOKEN не задан — работает только HTTP API.")
+        while True:
+            time.sleep(3600)
+    run_bot()
 
