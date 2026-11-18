@@ -1,52 +1,27 @@
-#!/usr/bin/env python3
-"""
-Бот рассылки Universal.
-
-Что умеет:
-  • Рассылка текста, картинки и/или звука всем пользователям плагина.
-  • Выборочная рассылка по конкретным людям из списка.
-  • Плагин сам регистрируется на сервере: /api/register  (POST).
-  • Список всех зарегистрированных пользователей виден в боте.
-
-Запуск:
-    BOT_TOKEN=123:ABC python3 bot.py
-
-Переменные окружения:
-    BOT_TOKEN   токен бота (обязательно)
-    PORT        порт HTTP-сервера (по умолчанию 8080)
-    DATA_FILE   файл с текущим сообщением (data.json)
-    USERS_FILE  файл с пользователями плагина (users.json)
-"""
 import base64, hashlib, json, os, threading, time, urllib.error, urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-TOKEN    = os.environ.get("BOT_TOKEN", "").strip()
-PORT     = int(os.environ.get("PORT", "8080"))
+TOKEN      = os.environ.get("BOT_TOKEN", "").strip()
+PORT       = int(os.environ.get("PORT", "8080"))
 DATA_FILE  = os.environ.get("DATA_FILE",  "data.json")
 USERS_FILE = os.environ.get("USERS_FILE", "users.json")
+ADMIN_IDS  = {int(x) for x in os.environ.get("ADMIN_IDS", "").replace(" ", "").split(",") if x.strip().isdigit()}
 
-# Heartbeat window: the plugin registers every ~2 seconds while it is running.
-HEARTBEAT_TTL = int(os.environ.get("HEARTBEAT_TTL", "20"))
+# Плагин опрашивает сервер раз в минуту (ANNOUNCE_INTERVAL = 60),
+# поэтому окно "онлайн" с запасом на пропущенные опросы.
+HEARTBEAT_TTL = int(os.environ.get("HEARTBEAT_TTL", "150"))
 
 # ------------------------------------------------------------------ хранилище
 _lock  = threading.Lock()
 
-# текущее сообщение
 _state = {
     "id": 0, "title": "", "text": "",
-    "image": "",   # base64 JPEG/PNG (или пусто)
-    "sound": "",   # base64 MP3/OGG  (или пусто)
-    "volume": 100, # громкость звука в процентах: 0..100
-    "targets": [], # [] = всем; иначе список строк user_id
-    "ts": 0,
+    "image": "", "sound": "", "volume": 100,
+    "targets": [], "ts": 0,
 }
-
-# зарегистрированные пользователи плагина
-# ключ — строка user_id, значение — {"username": ..., "first_name": ..., "ts": ...}
 _users: dict = {}
-
-# черновики: chat_id -> {"title", "text", "image_b64", "sound_b64", "targets"}
 _drafts: dict = {}
+_last_users_save = 0.0
 
 
 def _load_json(path, default):
@@ -70,15 +45,11 @@ def _save_json(path, data):
 
 
 def load_all():
-    _state.update(_load_json(DATA_FILE,  _state))
+    _state.update(_load_json(DATA_FILE, _state))
     _users.update(_load_json(USERS_FILE, {}))
 
 
-# ------------------------------------------------------------------ публикация
-def publish(title: str, text: str,
-            image_b64: str = "", sound_b64: str = "",
-            targets: list | None = None, volume: int = 100) -> int:
-    """Новое сообщение. targets=None → всем; targets=["123","456"] → только им."""
+def publish(title, text, image_b64="", sound_b64="", targets=None, volume=100) -> int:
     with _lock:
         _state["id"]      = max(int(_state["id"]) + 1, int(time.time()))
         _state["title"]   = title[:120]
@@ -97,7 +68,6 @@ def _api_body_for(user_id: str) -> bytes:
     with _lock:
         tgts = _state.get("targets") or []
         if tgts and str(user_id) not in tgts:
-            # не для этого пользователя — пустой ответ (id=0 → плагин игнорирует)
             return json.dumps({"id": 0, "title": "", "text": "", "image": "", "sound": "", "volume": 100},
                               ensure_ascii=False).encode()
         return json.dumps({
@@ -110,6 +80,25 @@ def _api_body_for(user_id: str) -> bytes:
         }, ensure_ascii=False).encode()
 
 
+def _touch_user(uid: str):
+    """Heartbeat: обновляем ts известного пользователя. На диск пишем не чаще раза в 5 минут."""
+    global _last_users_save
+    if not uid:
+        return
+    now = int(time.time())
+    with _lock:
+        info = _users.get(uid)
+        if info is None:
+            return
+        info["ts"] = now
+        if now - _last_users_save >= 300:
+            _last_users_save = now
+            try:
+                _save_json(USERS_FILE, _users)
+            except Exception as exc:
+                print("save users:", exc)
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *a): pass
 
@@ -117,13 +106,13 @@ class Handler(BaseHTTPRequestHandler):
         path = self.path.split("?", 1)[0].rstrip("/")
 
         if path == "/api":
-            # плагин передаёт свой user_id через заголовок или query-param
             uid = ""
             qs  = self.path.split("?", 1)[1] if "?" in self.path else ""
             for part in qs.split("&"):
                 if part.startswith("uid="):
                     uid = part[4:]
             uid = uid or self.headers.get("X-User-Id", "")
+            _touch_user(uid)
             body = _api_body_for(uid)
             etag = '"%s"' % hashlib.md5(body).hexdigest()
             if self.headers.get("If-None-Match", "").strip() == etag:
@@ -134,19 +123,15 @@ class Handler(BaseHTTPRequestHandler):
                        extra={"Cache-Control": "no-cache", "ETag": etag})
 
         elif path == "/api/users":
-            # список зарегистрированных пользователей (для бота и отладки)
             with _lock:
                 body = json.dumps(_users, ensure_ascii=False).encode()
             self._send(200, body, content_type="application/json; charset=utf-8")
-
         else:
             self._send(200, b"ok", content_type="text/plain")
 
     def do_POST(self):
         path = self.path.split("?", 1)[0].rstrip("/")
-
         if path == "/api/register":
-            # плагин регистрирует пользователя при каждом запуске
             length = int(self.headers.get("Content-Length", 0))
             raw    = self.rfile.read(length)
             try:
@@ -167,10 +152,7 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self._send(404, b"not found")
 
-    def _send(self, code: int, body: bytes,
-              content_type: str = "text/plain",
-              etag: str = "",
-              extra: dict | None = None):
+    def _send(self, code, body, content_type="text/plain", etag="", extra=None):
         self.send_response(code)
         if content_type:
             self.send_header("Content-Type", content_type)
@@ -198,36 +180,9 @@ def tg(method: str, **params):
         return json.loads(r.read()).get("result")
 
 
-def tg_file(method: str, chat_id: int, field: str, file_id_or_bytes,
-            is_bytes: bool = False, **extra):
-    """Отправка файла: либо по file_id (строка), либо bytes → multipart."""
-    if not is_bytes:
-        return tg(method, chat_id=chat_id, **{field: file_id_or_bytes}, **extra)
-    # multipart upload
-    import io, random, string
-    boundary = "---" + "".join(random.choices(string.ascii_lowercase, k=16))
-    buf = io.BytesIO()
-    def w(s): buf.write(s.encode() if isinstance(s, str) else s)
-    for k, v in [("chat_id", str(chat_id))] + [(k2, str(v2)) for k2, v2 in extra.items()]:
-        w("--%s\r\n" % boundary)
-        w('Content-Disposition: form-data; name="%s"\r\n\r\n' % k)
-        w("%s\r\n" % v)
-    w("--%s\r\n" % boundary)
-    w('Content-Disposition: form-data; name="%s"; filename="file"\r\n\r\n' % field)
-    w(file_id_or_bytes)
-    w("\r\n--%s--\r\n" % boundary)
-    req = urllib.request.Request(
-        "https://api.telegram.org/bot%s/%s" % (TOKEN, method),
-        data=buf.getvalue(),
-        headers={"Content-Type": "multipart/form-data; boundary=" + boundary})
-    with urllib.request.urlopen(req, timeout=60) as r:
-        return json.loads(r.read()).get("result")
-
-
 def download_file(file_id: str) -> bytes:
     info = tg("getFile", file_id=file_id)
-    path = info["file_path"]
-    url  = "https://api.telegram.org/file/bot%s/%s" % (TOKEN, path)
+    url  = "https://api.telegram.org/file/bot%s/%s" % (TOKEN, info["file_path"])
     with urllib.request.urlopen(url, timeout=30) as r:
         return r.read()
 
@@ -239,14 +194,23 @@ def say(chat_id: int, text: str, **extra):
         print("sendMessage:", exc)
 
 
-# ------------------------------------------------------------------ user list helpers
-def users_list() -> list[tuple[str, str]]:
-    """Возвращает [(user_id, label), ...], отсортировано по имени."""
+def edit_screen(chat_id: int, msg_id: int, text: str, keyboard=None):
+    params = {"chat_id": chat_id, "message_id": msg_id, "text": text}
+    if keyboard is not None:
+        params["reply_markup"] = keyboard
+    try:
+        tg("editMessageText", **params)
+    except Exception:
+        say(chat_id, text, **({"reply_markup": keyboard} if keyboard else {}))
+
+
+# ------------------------------------------------------------------ пользователи
+def users_list():
     with _lock:
         rows = list(_users.items())
     result = []
     for uid, info in rows:
-        name = info.get("first_name", "").strip()
+        name  = info.get("first_name", "").strip()
         uname = info.get("username", "").strip()
         label = name or ("@" + uname if uname else "id" + uid)
         if uname:
@@ -255,8 +219,7 @@ def users_list() -> list[tuple[str, str]]:
     return sorted(result, key=lambda x: x[1].lower())
 
 
-def user_is_active(uid: str, now: int | None = None) -> bool:
-    """True только при свежем heartbeat; offline и отключённый плагин не различимы."""
+def user_is_active(uid: str, now=None) -> bool:
     now = int(now or time.time())
     with _lock:
         info = _users.get(str(uid), {})
@@ -267,7 +230,7 @@ def user_is_active(uid: str, now: int | None = None) -> bool:
     return last_seen > 0 and (now - last_seen) <= HEARTBEAT_TTL
 
 
-def active_user_ids() -> list[str]:
+def active_user_ids():
     now = int(time.time())
     with _lock:
         rows = list(_users.items())
@@ -277,76 +240,69 @@ def active_user_ids() -> list[str]:
 
 
 def user_status_label(uid: str) -> str:
-    return "🟢 включён" if user_is_active(uid) else "⚪ выключен / нет связи"
+    return "🟢 онлайн" if user_is_active(uid) else "⚪ офлайн"
 
 
-def users_keyboard(selected: set[str] | None = None) -> dict:
-    """Inline-клавиатура: список пользователей с чекбоксами."""
+def users_keyboard(selected=None) -> dict:
+    """Inline-список людей с галочками (выбор получателей)."""
     rows = []
     selected = selected or set()
     for uid, label in users_list():
-        mark = "✅ " if uid in selected else ""
+        mark   = "✅ " if uid in selected else ""
         status = "🟢 " if user_is_active(uid) else "⚪ "
         rows.append([{"text": mark + status + label, "callback_data": "usr:" + uid}])
-    rows.append([
-        {"text": "📨 Отправить выбранным", "callback_data": "send_sel"},
-        {"text": "📢 Всем",               "callback_data": "send_all"},
-    ])
-    rows.append([{"text": "❌ Отмена", "callback_data": "cancel"}])
+    rows.append([{"text": "✔️ Готово", "callback_data": "back_editor"}])
     return {"inline_keyboard": rows}
 
 
-# ------------------------------------------------------------------ bot logic
-HELP = (
-    "📢 Рассылка Universal\n\n"
-    "Нажмите кнопку «Отправить рассылку», затем добавьте текст, фото или звук.\n"
-    "Громкость звука настраивается от 0 до 100%.\n\n"
-    "/users — список пользователей\n"
-    "/status — текущая публикация\n"
-    "/clear — снять сообщение\n"
-    "/menu — открыть меню"
-)
+# ------------------------------------------------------------------ нижняя клавиатура
+BTN_NEW, BTN_USERS, BTN_STATUS = "📨 Новая рассылка", "👥 Пользователи", "📊 Статус"
+BTN_CLEAR, BTN_HELP            = "🧹 Снять сообщение", "❓ Помощь"
+
+BTN_TEXT, BTN_PHOTO, BTN_SOUND = "✏️ Текст", "🖼 Фото", "🔊 Звук"
+BTN_VOL, BTN_PREVIEW, BTN_PICK = "🔉 Громкость", "👀 Предпросмотр", "👥 Получатели"
+BTN_SEND_ALL, BTN_SEND_SEL     = "🚀 Всем онлайн", "📨 Выбранным"
+BTN_CANCEL                     = "❌ Отмена"
 
 
-def main_keyboard() -> dict:
-    return {"inline_keyboard": [[
-        {"text": "📨 Отправить рассылку", "callback_data": "new_broadcast"}
-    ]]}
+def _reply_kb(rows) -> dict:
+    return {"keyboard": [[{"text": t} for t in row] for row in rows],
+            "resize_keyboard": True, "is_persistent": True}
 
 
-def editor_keyboard() -> dict:
-    return {"inline_keyboard": [
-        [
-            {"text": "✏️ Добавить текст", "callback_data": "add_text"},
-            {"text": "🖼 Добавить фото", "callback_data": "add_photo"},
-        ],
-        [
-            {"text": "🔊 Добавить звук", "callback_data": "add_sound"},
-            {"text": "🔉 Настройка громкости", "callback_data": "volume_menu"},
-        ],
-        [
-            {"text": "👀 Предпросмотр", "callback_data": "preview"},
-            {"text": "👥 Получатели", "callback_data": "pick_users"},
-        ],
-        [
-            {"text": "🚀 Опубликовать всем", "callback_data": "send_all"},
-            {"text": "❌ Отмена", "callback_data": "cancel"},
-        ],
-    ]}
+def main_kb() -> dict:
+    return _reply_kb([[BTN_NEW, BTN_USERS], [BTN_STATUS, BTN_CLEAR], [BTN_HELP]])
+
+
+def editor_kb() -> dict:
+    return _reply_kb([
+        [BTN_TEXT, BTN_PHOTO], [BTN_SOUND, BTN_VOL],
+        [BTN_PREVIEW, BTN_PICK], [BTN_SEND_ALL, BTN_SEND_SEL],
+        [BTN_CANCEL],
+    ])
 
 
 def volume_keyboard(volume: int) -> dict:
-    values = [0, 25, 50, 75, 100]
     row = []
-    for value in values:
+    for value in (0, 25, 50, 75, 100):
         mark = " ✓" if value == volume else ""
         row.append({"text": "%d%%%s" % (value, mark), "callback_data": "vol:%d" % value})
-    return {"inline_keyboard": [row, [
-        {"text": "−10", "callback_data": "vol:-10"},
-        {"text": "+10", "callback_data": "vol:+10"},
-    ], [{"text": "↩️ Назад", "callback_data": "back_editor"}]]}
+    return {"inline_keyboard": [row,
+            [{"text": "−10", "callback_data": "vol:-10"}, {"text": "+10", "callback_data": "vol:+10"}],
+            [{"text": "↩️ Назад", "callback_data": "back_editor"}]]}
 
 
+HELP = (
+    "📢 Рассылка Universal\n\n"
+    "Всё управление — кнопками внизу.\n"
+    "«📨 Новая рассылка» → добавьте текст / фото / звук → «🚀 Всем онлайн» "
+    "или выберите людей через «👥 Получатели» и нажмите «📨 Выбранным».\n"
+    "Заголовок и текст можно прислать одним сообщением: Заголовок || Текст\n\n"
+    "Команды тоже работают: /menu /users /status /clear"
+)
+
+
+# ------------------------------------------------------------------ черновик
 def _draft(chat_id: int) -> dict:
     return _drafts.setdefault(chat_id, {
         "title": "", "text": "", "image_b64": "", "sound_b64": "",
@@ -355,88 +311,190 @@ def _draft(chat_id: int) -> dict:
 
 
 def _editor_text(d: dict) -> str:
-    parts = ["📝 Настройка рассылки"]
-    parts.append("Текст: %s" % ("добавлен" if d.get("text") else "не добавлен"))
-    parts.append("Фото: %s" % ("добавлено" if d.get("image_b64") else "не добавлено"))
-    parts.append("Звук: %s" % ("добавлен" if d.get("sound_b64") else "не добавлен"))
-    parts.append("Громкость: %d%%" % int(d.get("volume", 100)))
-    parts.append("\nВыберите действие:")
-    return "\n".join(parts)
+    sel = d.get("selected") or set()
+    return "\n".join([
+        "📝 Настройка рассылки",
+        "Текст: %s" % ("✅" if d.get("text") else "—"),
+        "Фото: %s" % ("✅" if d.get("image_b64") else "—"),
+        "Звук: %s" % ("✅" if d.get("sound_b64") else "—"),
+        "Громкость: %d%%" % int(d.get("volume", 100)),
+        "Получатели: %s" % ("выбрано %d" % len(sel) if sel else "не выбраны (кнопка «Всем онлайн»)"),
+    ])
 
 
-def show_editor(chat_id: int):
+def show_editor(chat_id: int, prefix: str = ""):
+    say(chat_id, (prefix + "\n\n" if prefix else "") + _editor_text(_draft(chat_id)),
+        reply_markup=editor_kb())
+
+
+def show_main(chat_id: int, text: str = "📢 Главное меню"):
+    say(chat_id, text, reply_markup=main_kb())
+
+
+def show_preview(chat_id: int):
     d = _draft(chat_id)
-    say(chat_id, _editor_text(d), reply_markup=editor_keyboard())
+    parts = ["👀 Предпросмотр:"]
+    if d.get("title"): parts.append(d["title"])
+    if d.get("text"):  parts.append(d["text"])
+    if d.get("image_b64"): parts.append("🖼 Картинка прикреплена")
+    if d.get("sound_b64"): parts.append("🔊 Звук прикреплён, громкость: %d%%" % int(d.get("volume", 100)))
+    if not any((d.get("text"), d.get("image_b64"), d.get("sound_b64"))):
+        parts.append("Пока ничего не добавлено.")
+    say(chat_id, "\n".join(parts)[:4000], reply_markup=editor_kb())
 
 
-def edit_screen(chat_id: int, msg_id: int, text: str, keyboard: dict | None = None):
-    params = {"chat_id": chat_id, "message_id": msg_id, "text": text}
-    if keyboard is not None:
-        params["reply_markup"] = keyboard
-    try:
-        tg("editMessageText", **params)
-    except Exception:
-        say(chat_id, text, **({"reply_markup": keyboard} if keyboard else {}))
+def do_publish(chat_id: int, only_selected: bool) -> str:
+    """Публикует черновик. Возвращает текст результата."""
+    d = _draft(chat_id)
+    if not (d.get("text") or d.get("image_b64") or d.get("sound_b64")):
+        return "ℹ️ Черновик пуст. Добавьте текст, фото или звук."
+    if only_selected:
+        sel = list(d.get("selected") or set())
+        if not sel:
+            return "Никто не выбран. Нажмите «👥 Получатели» или «🚀 Всем онлайн»."
+        offline = [t for t in sel if not user_is_active(t)]
+        if offline:
+            labels = dict(users_list())
+            return ("⛔ Не опубликовано: сейчас офлайн — " +
+                    ", ".join(labels.get(t, "id" + t) for t in offline) +
+                    ".\nПлагин может быть выключен, приложение закрыто или нет интернета.")
+    else:
+        sel = active_user_ids()
+        if not sel:
+            return "⛔ Не опубликовано: сейчас нет пользователей онлайн."
+    new_id = publish(d.get("title", ""), d.get("text", ""),
+                     d.get("image_b64", ""), d.get("sound_b64", ""),
+                     targets=sel, volume=int(d.get("volume", 100)))
+    _drafts.pop(chat_id, None)
+    return ("✅ Опубликовано для %d польз. (№%d). Плагин получит сообщение при ближайшем опросе "
+            "(до минуты); фактический показ на устройстве не гарантирован.") % (len(sel), new_id)
 
 
+# ------------------------------------------------------------------ действия
+def action_new(chat_id):
+    _drafts[chat_id] = {"title": "", "text": "", "image_b64": "", "sound_b64": "",
+                        "volume": 100, "selected": set(), "pending": ""}
+    show_editor(chat_id)
+
+
+def action_users(chat_id):
+    rows = users_list()
+    if not rows:
+        show_main(chat_id, "Пока нет зарегистрированных пользователей.")
+        return
+    online = sum(1 for uid, _ in rows if user_is_active(uid))
+    lines = ["👥 Пользователи плагина: %d (онлайн %d)" % (len(rows), online)]
+    for uid, label in rows[:50]:
+        lines.append("• %s — %s  [%s]" % (label, user_status_label(uid), uid))
+    say(chat_id, "\n".join(lines)[:4000])
+
+
+def action_status(chat_id):
+    with _lock:
+        cur = dict(_state)
+    if cur["text"] or cur["image"] or cur["sound"]:
+        parts = ["Сейчас опубликовано (№%d):" % cur["id"]]
+        if cur["title"]: parts.append(cur["title"])
+        if cur["text"]:  parts.append(cur["text"])
+        if cur["image"]: parts.append("🖼 Картинка есть")
+        if cur["sound"]: parts.append("🔊 Звук есть, громкость %d%%" % int(cur.get("volume", 100)))
+        tgts = cur.get("targets") or []
+        parts.append("Получатели: %s" % (", ".join(tgts) if tgts else "все"))
+        say(chat_id, "\n".join(parts)[:4000])
+    else:
+        say(chat_id, "Сейчас ничего не показывается.")
+
+
+def action_clear(chat_id):
+    publish("", "", "", "", [], volume=100)
+    say(chat_id, "✅ Сообщение снято.")
+
+
+def action_prompt(chat_id, kind):
+    d = _draft(chat_id)
+    d["pending"] = kind
+    say(chat_id, {
+        "text":  "✏️ Отправьте текст одним сообщением.\nС заголовком: Заголовок || Текст",
+        "photo": "🖼 Отправьте фото (можно с подписью — она станет текстом).",
+        "sound": "🔊 Отправьте аудиофайл или голосовое.",
+    }[kind], reply_markup=editor_kb())
+
+
+def action_volume(chat_id):
+    v = int(_draft(chat_id).get("volume", 100))
+    say(chat_id, "🔉 Громкость звука: %d%%" % v, reply_markup=volume_keyboard(v))
+
+
+def action_pick(chat_id):
+    if not users_list():
+        say(chat_id, "Пока нет зарегистрированных пользователей. Дождитесь, когда кто-то запустит плагин.",
+            reply_markup=editor_kb())
+        return
+    say(chat_id, "Выберите получателей (нажмите, чтобы отметить):",
+        reply_markup=users_keyboard(_draft(chat_id).get("selected") or set()))
+
+
+def action_cancel(chat_id):
+    _drafts.pop(chat_id, None)
+    show_main(chat_id, "Отменено.")
+
+
+def finish_publish(chat_id, only_selected):
+    result = do_publish(chat_id, only_selected)
+    if result.startswith("✅"):
+        show_main(chat_id, result)
+    else:
+        say(chat_id, result, reply_markup=editor_kb() if chat_id in _drafts else main_kb())
+
+
+BUTTONS = {
+    BTN_NEW: action_new, BTN_USERS: action_users, BTN_STATUS: action_status,
+    BTN_CLEAR: action_clear, BTN_HELP: lambda c: say(c, HELP, reply_markup=main_kb()),
+    BTN_TEXT: lambda c: action_prompt(c, "text"),
+    BTN_PHOTO: lambda c: action_prompt(c, "photo"),
+    BTN_SOUND: lambda c: action_prompt(c, "sound"),
+    BTN_VOL: action_volume, BTN_PREVIEW: show_preview, BTN_PICK: action_pick,
+    BTN_SEND_ALL: lambda c: finish_publish(c, False),
+    BTN_SEND_SEL: lambda c: finish_publish(c, True),
+    BTN_CANCEL: action_cancel,
+}
+COMMANDS = {"/menu": lambda c: show_main(c), "/start": lambda c: show_main(c),
+            "/help": BUTTONS[BTN_HELP], "/users": action_users,
+            "/status": action_status, "/clear": action_clear}
+
+
+def allowed(user_id: int) -> bool:
+    return not ADMIN_IDS or int(user_id) in ADMIN_IDS
+
+
+# ------------------------------------------------------------------ обработчики
 def handle_message(msg: dict):
     chat_id = int(msg["chat"]["id"])
+    if not allowed(msg.get("from", {}).get("id", 0)):
+        return
     text    = (msg.get("text") or "").strip()
     photo   = msg.get("photo")
     audio   = msg.get("audio") or msg.get("voice") or msg.get("document")
     caption = (msg.get("caption") or "").strip()
 
-    if text in ("/start", "/menu"):
-        say(chat_id, "📢 Панель управления рассылкой", reply_markup=main_keyboard())
-        return
-    if text == "/help":
-        say(chat_id, HELP, reply_markup=main_keyboard())
-        return
-
-    if text == "/status":
-        with _lock:
-            cur = dict(_state)
-        if cur["text"] or cur["image"] or cur["sound"]:
-            parts = ["Сейчас опубликовано (№%d):" % cur["id"]]
-            if cur["title"]: parts.append(cur["title"])
-            if cur["text"]: parts.append(cur["text"])
-            if cur["image"]: parts.append("🖼 Картинка есть")
-            if cur["sound"]: parts.append("🔊 Звук есть, громкость %d%%" % int(cur.get("volume", 100)))
-            tgts = cur.get("targets") or []
-            parts.append("Получатели: %s" % (", ".join(tgts) if tgts else "все"))
-            say(chat_id, "\n".join(parts), reply_markup=main_keyboard())
-        else:
-            say(chat_id, "Сейчас ничего не показывается.", reply_markup=main_keyboard())
-        return
-
-    if text == "/clear":
-        publish("", "", "", "", [], volume=100)
-        say(chat_id, "✅ Сообщение снято.", reply_markup=main_keyboard())
-        return
-
-    if text == "/users":
-        rows = users_list()
-        if not rows:
-            say(chat_id, "Пока нет зарегистрированных пользователей.", reply_markup=main_keyboard())
-        else:
-            lines = ["👥 Пользователи плагина (%d):" % len(rows)]
-            for uid, label in rows[:50]:
-                lines.append("• %s — %s  [%s]" % (label, user_status_label(uid), uid))
-            say(chat_id, "\n".join(lines), reply_markup=main_keyboard())
+    # кнопки нижней клавиатуры и команды — всегда в приоритете
+    action = BUTTONS.get(text) or COMMANDS.get(text.split("@")[0])
+    if action:
+        if chat_id in _drafts:
+            _drafts[chat_id]["pending"] = ""
+        action(chat_id)
         return
 
     d = _draft(chat_id)
     pending = d.get("pending", "")
 
     if photo:
-        file_id = photo[-1]["file_id"]
         try:
-            raw = download_file(file_id)
-            d["image_b64"] = base64.b64encode(raw).decode()
+            d["image_b64"] = base64.b64encode(download_file(photo[-1]["file_id"])).decode()
             if caption:
                 d["text"] = caption
             d["pending"] = ""
-            say(chat_id, "✅ Фото добавлено.\n\n" + _editor_text(d), reply_markup=editor_keyboard())
+            show_editor(chat_id, "✅ Фото добавлено.")
         except Exception as exc:
             say(chat_id, "Не удалось скачать фото: " + str(exc))
         return
@@ -447,23 +505,11 @@ def handle_message(msg: dict):
             say(chat_id, "Не могу получить файл.")
             return
         try:
-            raw = download_file(file_id)
-            d["sound_b64"] = base64.b64encode(raw).decode()
+            d["sound_b64"] = base64.b64encode(download_file(file_id)).decode()
             d["pending"] = ""
-            say(chat_id, "✅ Звук добавлен.\n\n" + _editor_text(d), reply_markup=editor_keyboard())
+            show_editor(chat_id, "✅ Звук добавлен.")
         except Exception as exc:
             say(chat_id, "Не удалось скачать аудио: " + str(exc))
-        return
-
-    if pending == "text" and text:
-        if "||" in text:
-            title, body = text.split("||", 1)
-            d["title"] = title.strip()
-            d["text"] = body.strip()
-        else:
-            d["text"] = text
-        d["pending"] = ""
-        say(chat_id, "✅ Текст добавлен.\n\n" + _editor_text(d), reply_markup=editor_keyboard())
         return
 
     if text.startswith("/send"):
@@ -471,41 +517,29 @@ def handle_message(msg: dict):
         if body:
             d["text"] = body
         d["pending"] = ""
-        _show_preview(chat_id, d)
+        show_preview(chat_id)
         return
 
     if text.startswith("/"):
-        say(chat_id, HELP, reply_markup=main_keyboard())
+        say(chat_id, HELP, reply_markup=main_kb())
         return
 
     if text:
-        d["text"] = text
-        _show_preview(chat_id, d)
+        if "||" in text:
+            title, body = text.split("||", 1)
+            d["title"], d["text"] = title.strip(), body.strip()
+        else:
+            d["text"] = text
+        d["pending"] = ""
+        show_editor(chat_id, "✅ Текст добавлен.")
         return
 
-    say(chat_id, "Используйте кнопки меню, чтобы собрать рассылку.", reply_markup=main_keyboard())
-
-
-def _show_preview(chat_id: int, d: dict):
-    parts = ["👀 Предпросмотр:"]
-    if d.get("title"): parts.append(d["title"])
-    if d.get("text"): parts.append(d["text"])
-    if d.get("image_b64"): parts.append("🖼 Картинка прикреплена")
-    if d.get("sound_b64"):
-        parts.append("🔊 Звук прикреплён, громкость: %d%%" % int(d.get("volume", 100)))
-    if not any((d.get("text"), d.get("image_b64"), d.get("sound_b64"))):
-        parts.append("Пока ничего не добавлено.")
-    kb = {"inline_keyboard": [
-        [{"text": "↩️ К настройкам", "callback_data": "back_editor"}],
-        [{"text": "🚀 Опубликовать всем", "callback_data": "send_all"},
-         {"text": "👥 Выбрать получателей", "callback_data": "pick_users"}],
-        [{"text": "❌ Отмена", "callback_data": "cancel"}],
-    ]}
-    say(chat_id, "\n".join(parts)[:4000], reply_markup=kb)
+    show_main(chat_id, "Используйте кнопки внизу.")
 
 
 def handle_callback(cb: dict):
-    uid     = int(cb.get("from", {}).get("id", 0))
+    if not allowed(cb.get("from", {}).get("id", 0)):
+        return
     chat_id = int(cb["message"]["chat"]["id"])
     msg_id  = int(cb["message"]["message_id"])
     data    = cb.get("data", "")
@@ -514,142 +548,33 @@ def handle_callback(cb: dict):
     except Exception:
         pass
 
-    if data == "new_broadcast":
-        _drafts[chat_id] = {
-            "title": "", "text": "", "image_b64": "", "sound_b64": "",
-            "volume": 100, "selected": set(), "pending": ""
-        }
-        edit_screen(chat_id, msg_id, _editor_text(_draft(chat_id)), editor_keyboard())
-        return
-
-    if data in ("add_text", "add_photo", "add_sound"):
-        d = _draft(chat_id)
-        d["pending"] = {"add_text": "text", "add_photo": "photo", "add_sound": "sound"}[data]
-        prompts = {
-            "add_text": "✏️ Отправьте текст одним сообщением.\nМожно указать заголовок так: Заголовок || Текст",
-            "add_photo": "🖼 Теперь отправьте фотографию. Можно добавить подпись к фото.",
-            "add_sound": "🔊 Теперь отправьте аудио или голосовое сообщение.",
-        }
-        edit_screen(chat_id, msg_id, prompts[data], {"inline_keyboard": [[
-            {"text": "↩️ Назад", "callback_data": "back_editor"}
-        ]]})
-        return
-
-    if data == "volume_menu":
-        d = _draft(chat_id)
-        volume = int(d.get("volume", 100))
-        edit_screen(chat_id, msg_id, "🔉 Настройка громкости\nТекущее значение: %d%%" % volume,
-                    volume_keyboard(volume))
-        return
-
     if data.startswith("vol:"):
         d = _draft(chat_id)
-        value = data[4:]
-        current = int(d.get("volume", 100))
-        if value == "+10":
-            current += 10
-        elif value == "-10":
-            current -= 10
+        value, current = data[4:], int(_draft(chat_id).get("volume", 100))
+        if value == "+10":   current += 10
+        elif value == "-10": current -= 10
         else:
-            try:
-                current = int(value)
-            except ValueError:
-                current = 100
+            try: current = int(value)
+            except ValueError: current = 100
         d["volume"] = max(0, min(100, current))
-        edit_screen(chat_id, msg_id,
-                    "🔉 Настройка громкости\nТекущее значение: %d%%" % d["volume"],
-                    volume_keyboard(d["volume"]))
+        edit_screen(chat_id, msg_id, "🔉 Громкость звука: %d%%" % d["volume"], volume_keyboard(d["volume"]))
         return
 
-    if data == "back_editor":
-        d = _draft(chat_id)
-        d["pending"] = ""
-        edit_screen(chat_id, msg_id, _editor_text(d), editor_keyboard())
-        return
-
-    if data == "preview":
-        _show_preview(chat_id, _draft(chat_id))
-        return
-
-    # выбор пользователя (тоггл чекбокса)
     if data.startswith("usr:"):
-        target_uid = data[4:]
         sel = _draft(chat_id).setdefault("selected", set())
-        if target_uid in sel:
-            sel.discard(target_uid)
-        else:
-            sel.add(target_uid)
+        target = data[4:]
+        sel.discard(target) if target in sel else sel.add(target)
         try:
-            tg("editMessageReplyMarkup",
-               chat_id=chat_id, message_id=msg_id,
+            tg("editMessageReplyMarkup", chat_id=chat_id, message_id=msg_id,
                reply_markup=users_keyboard(sel))
         except Exception:
             pass
         return
 
-    if data == "pick_users":
+    if data == "back_editor":
         d = _draft(chat_id)
-        sel = d.get("selected") or set()
-        kb  = users_keyboard(sel)
-        if not users_list():
-            try:
-                tg("editMessageText", chat_id=chat_id, message_id=msg_id,
-                   text="Пока нет зарегистрированных пользователей. "
-                        "Дождитесь, когда кто-то запустит плагин.")
-            except Exception:
-                pass
-            return
-        try:
-            tg("editMessageText", chat_id=chat_id, message_id=msg_id,
-               text="Выберите получателей (нажмите чтобы отметить):",
-               reply_markup=kb)
-        except Exception:
-            pass
-        return
-
-    if data in ("send_all", "send_sel"):
-        d = _draft(chat_id)
-        if not (d.get("text") or d.get("image_b64") or d.get("sound_b64")):
-            say(chat_id, "ℹ️ Этот черновик уже опубликован или пуст. Создайте новое сообщение.")
-            return
-        if data == "send_sel":
-            sel = list(d.get("selected") or set())
-            if not sel:
-                say(chat_id, "Никто не выбран. Нажмите «Всем» или отметьте пользователей.")
-                return
-            inactive = [target for target in sel if not user_is_active(target)]
-            if inactive:
-                labels = dict(users_list())
-                names = [labels.get(target, "id" + target) for target in inactive]
-                say(chat_id, "⛔ Не опубликовано: у выбранных пользователей плагин сейчас не на связи: "
-                             + ", ".join(names)
-                             + ". Это может означать, что плагин выключен, приложение закрыто или нет интернета.")
-                return
-        else:
-            sel = active_user_ids()
-            if not sel:
-                say(chat_id, "⛔ Не опубликовано: сейчас нет пользователей с активным heartbeat плагина.")
-                return
-        new_id = publish(d.get("title", ""), d.get("text", ""),
-                         d.get("image_b64", ""), d.get("sound_b64", ""),
-                         targets=sel, volume=int(d.get("volume", 100)))
-        who = "%d активным пользователям" % len(sel)
-        result = ("✅ Объявление опубликовано на сервере для %s (№%d). "
-                  "Это подтверждает публикацию, но не гарантирует фактический показ на устройстве.") % (who, new_id)
-        _drafts.pop(chat_id, None)
-        try:
-            tg("editMessageText", chat_id=chat_id, message_id=msg_id, text=result)
-        except Exception:
-            say(chat_id, result)
-        return
-
-    if data == "cancel":
-        _drafts.pop(chat_id, None)
-        try:
-            tg("editMessageText", chat_id=chat_id, message_id=msg_id,
-               text="Отменено.", reply_markup=main_keyboard())
-        except Exception:
-            pass
+        d["pending"] = ""
+        edit_screen(chat_id, msg_id, _editor_text(d))
         return
 
 
@@ -677,6 +602,8 @@ if __name__ == "__main__":
     load_all()
     threading.Thread(target=run_http, daemon=True).start()
     print("HTTP  http://0.0.0.0:%d/api" % PORT)
+    if not ADMIN_IDS:
+        print("ВНИМАНИЕ: ADMIN_IDS не задан — бот отвечает любому пользователю.")
     if not TOKEN:
         print("BOT_TOKEN не задан — работает только HTTP API.")
         while True:
